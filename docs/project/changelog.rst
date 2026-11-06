@@ -32,6 +32,21 @@ notice.
 
 *In development*
 
+Improvements
+............
+
+* Added runtime policy frames in :mod:`websockets.policy` for the
+  :mod:`asyncio` and :mod:`threading` implementations. A policy frame is
+  pushed for the duration of a scope with :func:`~websockets.policy.policy_scope`
+  and can reject new sends (:attr:`~websockets.policy.SendAdmit.DENY_NEW` or
+  :attr:`~websockets.policy.SendAdmit.ONE_MORE`), reject or force an active
+  close (:attr:`~websockets.policy.CloseGate.DENY_CLOSE` or
+  :attr:`~websockets.policy.CloseGate.FORCE_CLOSE`), and disable or tighten
+  close, opening, and receive waits (:attr:`~websockets.policy.WaitGate.FREEZE`
+  or :attr:`~websockets.policy.WaitGate.SHRINK_NOW`). Frames are bound to the
+  current execution context — a task or a thread — and to a single connection,
+  without changing the permanent configuration of the connection.
+
 .. _17.4:
 
 17.4

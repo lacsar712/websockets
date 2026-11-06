@@ -227,6 +227,22 @@ class ExceptionsTests(unittest.TestCase):
                 ConcurrencyError("get() or get_iter() is already running"),
                 "get() or get_iter() is already running",
             ),
+            (
+                SendRejected("sending a new message is denied by policy"),
+                "sending a new message is denied by policy",
+            ),
+            (
+                SendRejected(),
+                "sending a new message is rejected by the policy in effect",
+            ),
+            (
+                CloseRejected("closing the connection is denied by policy"),
+                "closing the connection is denied by policy",
+            ),
+            (
+                CloseRejected(),
+                "closing the connection is rejected by the policy in effect",
+            ),
         ]:
             with self.subTest(exception=exception):
                 self.assertEqual(str(exception), exception_str)

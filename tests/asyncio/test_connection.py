@@ -12,13 +12,34 @@ from unittest.mock import Mock, patch
 from websockets.asyncio.connection import *
 from websockets.asyncio.connection import broadcast
 from websockets.exceptions import (
+    CloseRejected,
     ConcurrencyError,
+    ConnectionClosed,
     ConnectionClosedError,
     ConnectionClosedOK,
     PayloadTooBig,
+    SendRejected,
     TooManyFragments,
 )
-from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
+from websockets.frames import (
+    BINARY,
+    CLOSE,
+    CONT,
+    PING,
+    PONG,
+    TEXT,
+    Close,
+    CloseCode,
+    Frame,
+)
+from websockets.policy import (
+    CloseGate,
+    SendAdmit,
+    WaitGate,
+    policy_scope,
+    pop_policy,
+    push_policy,
+)
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 
 from ..protocol import RecordingProtocol
@@ -1545,6 +1566,202 @@ class ClientConnectionTests(LoggingTestCase, unittest.IsolatedAsyncioTestCase):
         """broadcast raises TypeError when called with an unsupported type."""
         with self.assertRaises(TypeError):
             broadcast([self.connection], ["⏳", "⌛️"])
+
+    # Test runtime policy frames.
+
+    async def test_policy_deny_new_rejects_sends(self):
+        """DENY_NEW rejects new sends observably and doesn't block later sends."""
+        with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+            with self.assertRaises(SendRejected):
+                await self.connection.send("denied")
+            await self.assertNoFrameSent()
+        await self.connection.send("allowed")
+        await self.assertFrameSent(Frame(TEXT, b"allowed"))
+
+    async def test_policy_one_more_admits_exactly_one_send(self):
+        """ONE_MORE admits one send and rejects the next one."""
+        with policy_scope(self.connection, send_admit=SendAdmit.ONE_MORE):
+            await self.connection.send("one")
+            with self.assertRaises(SendRejected):
+                await self.connection.send("two")
+            with self.assertRaises(SendRejected):
+                await self.connection.send("three")
+        await self.connection.send("four")
+        self.assertEqual(await self.remote_connection.recv(), "one")
+        self.assertEqual(await self.remote_connection.recv(), "four")
+
+    async def test_policy_nested_scopes_restore_outer_frame(self):
+        """Popping an inner frame restores the view of the outer frame."""
+        with policy_scope(self.connection, send_admit=SendAdmit.ONE_MORE):
+            with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+                with self.assertRaises(SendRejected):
+                    await self.connection.send("inner")
+            # The outer ONE_MORE frame governs again.
+            await self.connection.send("outer")
+            with self.assertRaises(SendRejected):
+                await self.connection.send("no more")
+        await self.assertFramesSent([Frame(TEXT, b"outer")])
+
+    async def test_policy_deny_new_during_fragmented_send_fails_connection(self):
+        """A DENY_NEW frame pushed mid-fragment fails the connection observably."""
+        pushed = []
+
+        async def fragments():
+            yield "first"
+            pushed.append(
+                push_policy(self.connection, send_admit=SendAdmit.DENY_NEW),
+            )
+            yield "second"
+            yield "third"
+
+        with self.assertRaises(SendRejected):
+            await self.connection.send(fragments())
+        pop_policy(self.connection, pushed[0])
+
+        # The half-sent fragmented message ended through a protocol error.
+        self.assertEqual(self.connection.state, CLOSED)
+        with self.assertRaises(ConnectionClosedError):
+            await self.connection.recv()
+        frames_rcvd = self.remote_connection.protocol.get_frames_rcvd()
+        # The first fragment was sent before the frame was pushed.
+        self.assertEqual(frames_rcvd[0], Frame(TEXT, b"first", fin=False))
+        # The remaining fragments weren't sent; a protocol error closed us.
+        self.assertEqual(frames_rcvd[-1].opcode, CLOSE)
+        self.assertEqual(
+            Close.parse(frames_rcvd[-1].data).code,
+            CloseCode.INTERNAL_ERROR,
+        )
+
+    async def test_policy_deny_close_rejects_active_close(self):
+        """DENY_CLOSE rejects close without marking the connection as closed."""
+        with policy_scope(self.connection, close_gate=CloseGate.DENY_CLOSE):
+            with self.assertRaises(CloseRejected):
+                await self.connection.close()
+            self.assertEqual(self.connection.state, OPEN)
+            await self.assertNoFrameSent()
+            await self.connection.send("still open")
+        await self.assertFrameSent(Frame(TEXT, b"still open"))
+
+    async def test_policy_deny_close_doesnt_swallow_peer_close(self):
+        """DENY_CLOSE only blocks active closes; a peer close still closes us."""
+        with policy_scope(self.connection, close_gate=CloseGate.DENY_CLOSE):
+            await self.remote_connection.close()
+            with self.assertRaises(ConnectionClosedOK):
+                await self.connection.recv()
+
+    async def test_policy_force_close_closes_immediately(self):
+        """FORCE_CLOSE terminates the connection immediately and observably."""
+        await self.connection.send("before force close")
+        # The earlier message is delivered before the connection is terminated.
+        self.assertEqual(await self.remote_connection.recv(), "before force close")
+
+        with policy_scope(self.connection, close_gate=CloseGate.FORCE_CLOSE):
+            await self.connection.close()
+
+        self.assertEqual(self.connection.state, CLOSED)
+        # The termination is observable on both sides of the connection.
+        with self.assertRaises(ConnectionClosed):
+            await self.connection.recv()
+        with self.assertRaises(ConnectionClosed):
+            await self.remote_connection.recv()
+
+    async def test_policy_force_close_when_closing(self):
+        """FORCE_CLOSE terminates at once even if a close is already in progress."""
+        with policy_scope(self.connection, close_gate=CloseGate.FORCE_CLOSE):
+            await self.remote_connection.close()
+            await self.wait_for_remote_side()
+            await self.connection.close()
+        self.assertEqual(self.connection.state, CLOSED)
+
+    async def test_policy_freeze_waits_for_delayed_close(self):
+        """FREEZE doesn't abort the closing handshake on close_timeout."""
+        if self.LOCAL is SERVER:
+            self.skipTest("only relevant on the client-side")
+        with assertDurationAtLeast(5 * MS, self.loop.time):
+            async with self.delay_eof_rcvd(5 * MS):
+                with policy_scope(self.connection, wait_gate=WaitGate.FREEZE):
+                    await self.connection.close()
+        self.assertEqual(self.connection.close_code, CloseCode.NORMAL_CLOSURE)
+        with self.assertRaises(ConnectionClosedOK):
+            await self.connection.recv()
+
+    async def test_policy_shrink_close_times_out_faster(self):
+        """SHRINK_NOW makes the closing handshake fail before close_timeout."""
+        if self.LOCAL is SERVER:
+            self.skipTest("only relevant on the client-side")
+        socket_, remote_socket = socket.socketpair()
+        protocol = Protocol(self.LOCAL)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        _transport, connection = await self.loop.create_connection(
+            lambda: Connection(protocol, close_timeout=1),
+            sock=socket_,
+        )
+        _remote_transport, remote_connection = await self.loop.create_connection(
+            lambda: InterceptingConnection(remote_protocol),
+            sock=remote_socket,
+        )
+        try:
+            start = self.loop.time()
+            with remote_connection.drop_eof_sent():
+                with policy_scope(
+                    connection,
+                    wait_gate=WaitGate.SHRINK_NOW,
+                    shrink=MS,
+                ):
+                    await connection.close()
+            # The SHRINK_NOW bound applies, not the 1s configured close_timeout.
+            self.assertLess(self.loop.time() - start, 10 * MS)
+            self.assertEqual(connection.state, CLOSED)
+        finally:
+            await remote_connection.close()
+            await connection.close()
+
+    async def test_policy_shrink_recv_times_out_without_losing_data(self):
+        """SHRINK_NOW bounds recv and keeps the connection usable."""
+        with policy_scope(
+            self.connection,
+            wait_gate=WaitGate.SHRINK_NOW,
+            shrink=MS,
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.connection.recv()
+        self.assertEqual(self.connection.state, OPEN)
+        await self.remote_connection.send("after timeout")
+        self.assertEqual(await self.connection.recv(), "after timeout")
+
+    async def test_policy_freeze_recv_still_reports_close(self):
+        """FREEZE doesn't fabricate an empty message or swallow a real close."""
+        with policy_scope(self.connection, wait_gate=WaitGate.FREEZE):
+            await self.remote_connection.close()
+            with self.assertRaises(ConnectionClosedOK):
+                await self.connection.recv()
+
+    async def test_policy_is_scoped_per_connection(self):
+        """A frame pushed for one connection doesn't affect another connection."""
+        with policy_scope(self.remote_connection, send_admit=SendAdmit.DENY_NEW):
+            await self.connection.send("unaffected")
+            with self.assertRaises(SendRejected):
+                await self.remote_connection.send("blocked")
+        await self.assertFrameSent(Frame(TEXT, b"unaffected"))
+
+    async def test_policy_concurrent_scopes_dont_cross(self):
+        """Concurrent tasks pushing different frames don't share their stacks."""
+        entered = asyncio.Event()
+
+        async def denied_scope():
+            with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+                entered.set()
+                await asyncio.sleep(0)
+                with self.assertRaises(SendRejected):
+                    await self.connection.send("denied")
+
+        async def allowed_scope():
+            await entered.wait()
+            await asyncio.sleep(0)
+            await self.connection.send("allowed")
+
+        await asyncio.gather(denied_scope(), allowed_scope())
+        await self.assertFrameSent(Frame(TEXT, b"allowed"))
 
 
 class ServerConnectionTests(ClientConnectionTests):

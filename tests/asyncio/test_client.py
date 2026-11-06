@@ -24,6 +24,7 @@ from websockets.exceptions import (
     SecurityError,
 )
 from websockets.extensions.permessage_deflate import PerMessageDeflate
+from websockets.policy import WaitGate, push_policy
 
 from ..proxy import ProxyMixin
 from ..utils import CLIENT_CONTEXT, MS, SERVER_CONTEXT, temp_unix_socket_path
@@ -463,6 +464,31 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             host, port = sock.getsockname()
             with self.assertRaises(TimeoutError) as raised:
                 async with connect(f"ws://{host}:{port}", open_timeout=MS):
+                    self.fail("did not raise")
+
+        self.assertEqual(
+            str(raised.exception),
+            "timed out during opening handshake",
+        )
+
+    async def test_policy_shrink_during_handshake(self):
+        """A SHRINK_NOW policy frame bounds the opening wait."""
+
+        def create_connection(*args, **kwargs):
+            client = ClientConnection(*args, **kwargs)
+            # The factory runs in the connecting task's context.
+            push_policy(client, wait_gate=WaitGate.SHRINK_NOW, shrink=MS)
+            return client
+
+        # Replace the WebSocket server with a TCP server that doesn't respond.
+        with socket.create_server(("localhost", 0)) as sock:
+            host, port = sock.getsockname()
+            with self.assertRaises(TimeoutError) as raised:
+                async with connect(
+                    f"ws://{host}:{port}",
+                    open_timeout=10,
+                    create_connection=create_connection,
+                ):
                     self.fail("did not raise")
 
         self.assertEqual(

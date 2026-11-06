@@ -30,6 +30,7 @@ __all__ = [
     "HeadersLike",
     "MultipleValuesError",
     # .exceptions
+    "CloseRejected",
     "ConcurrencyError",
     "ConnectionClosed",
     "ConnectionClosedError",
@@ -59,6 +60,7 @@ __all__ = [
     "ProxyError",
     "RequestLineTooLong",
     "SecurityError",
+    "SendRejected",
     "StatusLineTooLong",
     "TooManyFragments",
     "TooManyHeaders",
@@ -102,6 +104,7 @@ if TYPE_CHECKING:
     from .client import ClientProtocol
     from .datastructures import Headers, HeadersLike, MultipleValuesError
     from .exceptions import (
+        CloseRejected,
         ConcurrencyError,
         ConnectionClosed,
         ConnectionClosedError,
@@ -131,6 +134,7 @@ if TYPE_CHECKING:
         ProxyError,
         RequestLineTooLong,
         SecurityError,
+        SendRejected,
         StatusLineTooLong,
         TooManyFragments,
         TooManyHeaders,
@@ -175,6 +179,7 @@ else:
             "HeadersLike": ".datastructures",
             "MultipleValuesError": ".datastructures",
             # .exceptions
+            "CloseRejected": ".exceptions",
             "ConcurrencyError": ".exceptions",
             "ConnectionClosed": ".exceptions",
             "ConnectionClosedError": ".exceptions",
@@ -204,6 +209,7 @@ else:
             "ProxyError": ".exceptions",
             "RequestLineTooLong": ".exceptions",
             "SecurityError": ".exceptions",
+            "SendRejected": ".exceptions",
             "StatusLineTooLong": ".exceptions",
             "TooManyFragments": ".exceptions",
             "TooManyHeaders": ".exceptions",

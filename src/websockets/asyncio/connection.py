@@ -14,6 +14,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, cast, overload
 
 from ..exceptions import (
+    CloseRejected,
     ConcurrencyError,
     ConnectionClosed,
     ConnectionClosedOK,
@@ -22,6 +23,13 @@ from ..exceptions import (
 )
 from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
+from ..policy import (
+    CloseGate,
+    admit_send,
+    current_close_gate,
+    effective_wait_timeout,
+    send_can_continue,
+)
 from ..protocol import CLOSED, OPEN, Event, Protocol, State
 from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
 from .messages import Assembler
@@ -293,10 +301,16 @@ class Connection(asyncio.Protocol):
             ConnectionClosed: When the connection is closed.
             ConcurrencyError: If two coroutines call :meth:`recv` or
                 :meth:`recv_streaming` concurrently.
+            TimeoutError: If a SHRINK_NOW policy frame bounds the wait and no
+                complete message is received in time.
 
         """
+        timeout, _ = effective_wait_timeout(self, None)
         try:
-            return await self.recv_messages.get(decode)
+            if timeout is None:
+                return await self.recv_messages.get(decode)
+            async with asyncio.timeout(timeout):
+                return await self.recv_messages.get(decode)
         except EOFError:
             pass
             # fallthrough
@@ -473,6 +487,10 @@ class Connection(asyncio.Protocol):
         while self.send_in_progress is not None:
             await asyncio.shield(self.send_in_progress)
 
+        # Apply the send admission policy pushed in the current scope, if any.
+        # A frame pushed after this point only affects later sends.
+        admit_send(self)
+
         # Unfragmented message — this case must be handled first because
         # strings and bytes-like objects are iterable.
 
@@ -508,6 +526,7 @@ class Connection(asyncio.Protocol):
             self.send_in_progress = self.loop.create_future()
             try:
                 # First fragment.
+                send_can_continue(self)
                 if isinstance(chunk, str):
                     async with self.send_context():
                         if text is False:
@@ -527,6 +546,7 @@ class Connection(asyncio.Protocol):
 
                 # Other fragments
                 for chunk in chunks:
+                    send_can_continue(self)
                     if isinstance(chunk, str) and encode:
                         async with self.send_context():
                             self.protocol.send_continuation(chunk.encode(), fin=False)
@@ -537,6 +557,7 @@ class Connection(asyncio.Protocol):
                         raise TypeError("iterable must contain uniform types")
 
                 # Final fragment.
+                send_can_continue(self)
                 async with self.send_context():
                     self.protocol.send_continuation(b"", fin=True)
 
@@ -567,6 +588,7 @@ class Connection(asyncio.Protocol):
             self.send_in_progress = self.loop.create_future()
             try:
                 # First fragment.
+                send_can_continue(self)
                 if isinstance(chunk, str):
                     if text is False:
                         async with self.send_context():
@@ -588,6 +610,7 @@ class Connection(asyncio.Protocol):
 
                 # Other fragments
                 async for chunk in achunks:
+                    send_can_continue(self)
                     if isinstance(chunk, str) and encode:
                         async with self.send_context():
                             self.protocol.send_continuation(chunk.encode(), fin=False)
@@ -598,6 +621,7 @@ class Connection(asyncio.Protocol):
                         raise TypeError("async iterable must contain uniform types")
 
                 # Final fragment.
+                send_can_continue(self)
                 async with self.send_context():
                     self.protocol.send_continuation(b"", fin=True)
 
@@ -636,7 +660,21 @@ class Connection(asyncio.Protocol):
             code: WebSocket close code.
             reason: WebSocket close reason.
 
+        Raises:
+            CloseRejected: If the close gate of the policy frame in effect
+                rejects active closes.
+
         """
+        close_gate = current_close_gate(self)
+        if close_gate is CloseGate.DENY_CLOSE:
+            raise CloseRejected(
+                "closing the connection is denied by the policy in effect"
+            )
+
+        if close_gate is CloseGate.FORCE_CLOSE:
+            await self.force_close(code, reason)
+            return
+
         try:
             # The context manager takes care of waiting for the TCP connection
             # to terminate after calling a method that sends a close frame.
@@ -652,6 +690,33 @@ class Connection(asyncio.Protocol):
             # Ignore ConnectionClosed exceptions raised from send_context().
             # They mean that the connection is closed, which was the goal.
             pass
+
+    async def force_close(
+        self,
+        code: CloseCode | int = CloseCode.NORMAL_CLOSURE,
+        reason: str = "",
+    ) -> None:
+        """
+        Fail the connection immediately and terminate the transport.
+
+        Unlike :meth:`close`, this doesn't wait for the other end to complete
+        the closing handshake. It still sends a close frame when possible; it
+        doesn't drop messages that were sent earlier.
+
+        """
+        if self.protocol.state is OPEN:
+            if self.send_in_progress is not None:
+                self.protocol.fail(
+                    CloseCode.INTERNAL_ERROR,
+                    "close during fragmented message",
+                )
+            else:
+                self.protocol.fail(code, reason)
+            # Write the close frame without waiting for flow control.
+            self.send_data()
+        self.transport.abort()
+        # Wait for the protocol state to be CLOSED before returning.
+        await asyncio.shield(self.connection_lost_waiter)
 
     async def wait_closed(self) -> None:
         """
@@ -943,7 +1008,7 @@ class Connection(asyncio.Protocol):
         # elapses, close the socket to terminate the connection.
         if wait_for_close:
             try:
-                async with asyncio.timeout_at(self.close_deadline):
+                async with asyncio.timeout_at(self.effective_close_deadline()):
                     await asyncio.shield(self.connection_lost_waiter)
             except TimeoutError:
                 # Set connection_exc before closing the transport in order to
@@ -1000,6 +1065,25 @@ class Connection(asyncio.Protocol):
         """
         if self.connection_exc is None:
             self.connection_exc = exc
+
+    def effective_close_deadline(self) -> float | None:
+        """
+        Compute the deadline for waiting for the closing handshake.
+
+        Merge the close timeout configured on the connection with the wait
+        policy pushed in the current scope, if any. Without an active frame,
+        this returns the deadline computed from the connection configuration.
+
+        """
+        timeout, governed = effective_wait_timeout(self, self.close_timeout)
+        if not governed:
+            return self.close_deadline
+        if timeout is None:
+            return None
+        deadline = self.loop.time() + timeout
+        if self.close_deadline is not None:
+            deadline = min(deadline, self.close_deadline)
+        return deadline
 
     # asyncio.Protocol methods
 

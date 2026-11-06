@@ -20,6 +20,7 @@ from ..headers import (
     validate_subprotocols,
 )
 from ..http11 import SERVER, Request, Response
+from ..policy import effective_wait_timeout
 from ..protocol import CONNECTING, OPEN, Event
 from ..server import ServerProtocol
 from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
@@ -132,10 +133,14 @@ class ServerConnection(Connection):
         Perform the opening handshake.
 
         """
-        await asyncio.wait(
+        timeout, _ = effective_wait_timeout(self, None)
+        done, _pending = await asyncio.wait(
             [self.request_rcvd, self.connection_lost_waiter],
+            timeout=timeout,
             return_when=asyncio.FIRST_COMPLETED,
         )
+        if not done:
+            raise TimeoutError("timed out while waiting for handshake request")
 
         if self.request is not None:
             response = None

@@ -17,6 +17,7 @@ from websockets.exceptions import (
     NegotiationError,
 )
 from websockets.http11 import Request, Response
+from websockets.policy import WaitGate, push_policy
 
 from ..utils import (
     CLIENT_CONTEXT,
@@ -448,6 +449,29 @@ class ServerTests(EvalShellMixin, LoggingTestCase, unittest.IsolatedAsyncioTestC
             "! no valid HTTP request",
             "connection closed while reading HTTP request line",
         )
+
+    async def test_policy_shrink_before_handshake_request(self):
+        """A SHRINK_NOW policy frame bounds the opening wait on the server."""
+
+        def create_connection(*args, **kwargs):
+            server_connection = ServerConnection(*args, **kwargs)
+            # The handler task inherits the context in which the connection
+            # is created, including this frame.
+            push_policy(
+                server_connection,
+                wait_gate=WaitGate.SHRINK_NOW,
+                shrink=MS,
+            )
+            return server_connection
+
+        with self.assertLogs("websockets", logging.DEBUG):
+            async with serve(*args, create_connection=create_connection) as server:
+                reader, writer = await asyncio.open_connection(*get_host_port(server))
+                try:
+                    # The server aborts the connection after the shrink bound.
+                    self.assertEqual(await reader.read(4096), b"")
+                finally:
+                    writer.close()
 
     async def test_connection_closed_before_handshake_request(self):
         """Server reads EOF before receiving handshake request from client."""

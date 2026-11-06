@@ -27,6 +27,7 @@ from ..headers import (
     validate_subprotocols,
 )
 from ..http11 import SERVER, Request, Response
+from ..policy import effective_wait_timeout
 from ..protocol import CONNECTING, OPEN, Event
 from ..server import ServerProtocol
 from ..typing import LoggerLike, Origin, PathLike, StatusLike, Subprotocol
@@ -142,6 +143,7 @@ class ServerConnection(Connection):
         Perform the opening handshake.
 
         """
+        timeout, _ = effective_wait_timeout(self, timeout)
         if not self.request_rcvd.wait(timeout):
             raise TimeoutError("timed out while waiting for handshake request")
 

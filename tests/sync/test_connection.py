@@ -11,13 +11,34 @@ import weakref
 from unittest.mock import Mock, patch
 
 from websockets.exceptions import (
+    CloseRejected,
     ConcurrencyError,
+    ConnectionClosed,
     ConnectionClosedError,
     ConnectionClosedOK,
     PayloadTooBig,
+    SendRejected,
     TooManyFragments,
 )
-from websockets.frames import BINARY, CLOSE, CONT, PING, PONG, TEXT, CloseCode, Frame
+from websockets.frames import (
+    BINARY,
+    CLOSE,
+    CONT,
+    PING,
+    PONG,
+    TEXT,
+    Close,
+    CloseCode,
+    Frame,
+)
+from websockets.policy import (
+    CloseGate,
+    SendAdmit,
+    WaitGate,
+    policy_scope,
+    pop_policy,
+    push_policy,
+)
 from websockets.protocol import CLIENT, CLOSED, OPEN, SERVER, Protocol
 from websockets.sync.connection import *
 from websockets.sync.connection import broadcast
@@ -1279,6 +1300,201 @@ class ClientConnectionTests(LoggingTestCase, ThreadTestCase):
         """broadcast raises TypeError when called with an unsupported type."""
         with self.assertRaises(TypeError):
             broadcast([self.connection], ["⏳", "⌛️"])
+
+    # Test runtime policy frames.
+
+    def test_policy_deny_new_rejects_sends(self):
+        """DENY_NEW rejects new sends observably and doesn't block later sends."""
+        with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+            with self.assertRaises(SendRejected):
+                self.connection.send("denied")
+            self.assertNoFrameSent()
+        self.connection.send("allowed")
+        self.assertFrameSent(Frame(TEXT, b"allowed"))
+
+    def test_policy_one_more_admits_exactly_one_send(self):
+        """ONE_MORE admits one send and rejects the next one."""
+        with policy_scope(self.connection, send_admit=SendAdmit.ONE_MORE):
+            self.connection.send("one")
+            with self.assertRaises(SendRejected):
+                self.connection.send("two")
+            with self.assertRaises(SendRejected):
+                self.connection.send("three")
+        self.connection.send("four")
+        self.assertEqual(self.remote_connection.recv(), "one")
+        self.assertEqual(self.remote_connection.recv(), "four")
+
+    def test_policy_nested_scopes_restore_outer_frame(self):
+        """Popping an inner frame restores the view of the outer frame."""
+        with policy_scope(self.connection, send_admit=SendAdmit.ONE_MORE):
+            with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+                with self.assertRaises(SendRejected):
+                    self.connection.send("inner")
+            # The outer ONE_MORE frame governs again.
+            self.connection.send("outer")
+            with self.assertRaises(SendRejected):
+                self.connection.send("no more")
+        self.assertFramesSent([Frame(TEXT, b"outer")])
+
+    def test_policy_deny_new_during_fragmented_send_fails_connection(self):
+        """A DENY_NEW frame pushed mid-fragment fails the connection observably."""
+        pushed = []
+
+        def fragments():
+            yield "first"
+            pushed.append(
+                push_policy(self.connection, send_admit=SendAdmit.DENY_NEW),
+            )
+            yield "second"
+            yield "third"
+
+        with self.assertRaises(SendRejected):
+            self.connection.send(fragments())
+        pop_policy(self.connection, pushed[0])
+
+        # The half-sent fragmented message ended through a protocol error.
+        self.assertEqual(self.connection.state, CLOSED)
+        with self.assertRaises(ConnectionClosedError):
+            self.connection.recv()
+        frames_rcvd = self.remote_connection.protocol.get_frames_rcvd()
+        # The first fragment was sent before the frame was pushed.
+        self.assertEqual(frames_rcvd[0], Frame(TEXT, b"first", fin=False))
+        # The remaining fragments weren't sent; a protocol error closed us.
+        self.assertEqual(frames_rcvd[-1].opcode, CLOSE)
+        self.assertEqual(
+            Close.parse(frames_rcvd[-1].data).code,
+            CloseCode.INTERNAL_ERROR,
+        )
+
+    def test_policy_deny_close_rejects_active_close(self):
+        """DENY_CLOSE rejects close without marking the connection as closed."""
+        with policy_scope(self.connection, close_gate=CloseGate.DENY_CLOSE):
+            with self.assertRaises(CloseRejected):
+                self.connection.close()
+            self.assertEqual(self.connection.state, OPEN)
+            self.assertNoFrameSent()
+            self.connection.send("still open")
+        self.assertFrameSent(Frame(TEXT, b"still open"))
+
+    def test_policy_deny_close_doesnt_swallow_peer_close(self):
+        """DENY_CLOSE only blocks active closes; a peer close still closes us."""
+        with policy_scope(self.connection, close_gate=CloseGate.DENY_CLOSE):
+            self.remote_connection.close()
+            with self.assertRaises(ConnectionClosedOK):
+                self.connection.recv()
+
+    def test_policy_force_close_closes_immediately(self):
+        """FORCE_CLOSE terminates the connection immediately and observably."""
+        self.connection.send("before force close")
+        # The earlier message is delivered before the connection is terminated.
+        self.assertEqual(self.remote_connection.recv(), "before force close")
+
+        with policy_scope(self.connection, close_gate=CloseGate.FORCE_CLOSE):
+            self.connection.close()
+
+        self.assertEqual(self.connection.state, CLOSED)
+        # The termination is observable on both sides of the connection.
+        with self.assertRaises(ConnectionClosed):
+            self.connection.recv()
+        with self.assertRaises(ConnectionClosed):
+            self.remote_connection.recv()
+
+    def test_policy_force_close_when_closing(self):
+        """FORCE_CLOSE terminates at once even if a close is already in progress."""
+        with policy_scope(self.connection, close_gate=CloseGate.FORCE_CLOSE):
+            self.remote_connection.close()
+            self.wait_for_remote_side()
+            self.connection.close()
+        self.assertEqual(self.connection.state, CLOSED)
+
+    def test_policy_freeze_waits_for_delayed_close(self):
+        """FREEZE doesn't abort the closing handshake on close_timeout."""
+        if self.LOCAL is SERVER:
+            self.skipTest("only relevant on the client-side")
+        with assertDurationAtLeast(5 * MS, time.time):
+            with self.delay_eof_rcvd(5 * MS):
+                with policy_scope(self.connection, wait_gate=WaitGate.FREEZE):
+                    self.connection.close()
+        self.assertEqual(self.connection.close_code, CloseCode.NORMAL_CLOSURE)
+        with self.assertRaises(ConnectionClosedOK):
+            self.connection.recv()
+
+    def test_policy_shrink_close_times_out_faster(self):
+        """SHRINK_NOW makes the closing handshake fail before close_timeout."""
+        if self.LOCAL is SERVER:
+            self.skipTest("only relevant on the client-side")
+        socket_, remote_socket = socket.socketpair()
+        protocol = Protocol(self.LOCAL)
+        remote_protocol = RecordingProtocol(self.REMOTE)
+        connection = Connection(socket_, protocol, close_timeout=1)
+        remote_connection = InterceptingConnection(remote_socket, remote_protocol)
+        try:
+            start = time.time()
+            with remote_connection.drop_eof_sent():
+                with policy_scope(
+                    connection,
+                    wait_gate=WaitGate.SHRINK_NOW,
+                    shrink=MS,
+                ):
+                    connection.close()
+            # The SHRINK_NOW bound applies, not the 1s configured close_timeout.
+            self.assertLess(time.time() - start, 10 * MS)
+            self.assertEqual(connection.state, CLOSED)
+        finally:
+            remote_connection.close()
+            connection.close()
+
+    def test_policy_shrink_recv_times_out_without_losing_data(self):
+        """SHRINK_NOW bounds recv and keeps the connection usable."""
+        with policy_scope(
+            self.connection,
+            wait_gate=WaitGate.SHRINK_NOW,
+            shrink=MS,
+        ):
+            with self.assertRaises(TimeoutError):
+                self.connection.recv()
+        self.assertEqual(self.connection.state, OPEN)
+        self.remote_connection.send("after timeout")
+        self.assertEqual(self.connection.recv(), "after timeout")
+
+    def test_policy_freeze_recv_ignores_timeout_on_close(self):
+        """FREEZE doesn't time out recv while the peer closes a bit later."""
+
+        def delayed_close():
+            time.sleep(5 * MS)
+            self.remote_connection.close()
+
+        thread = threading.Thread(target=delayed_close)
+        thread.start()
+        try:
+            with policy_scope(self.connection, wait_gate=WaitGate.FREEZE):
+                with self.assertRaises(ConnectionClosedOK):
+                    # Without FREEZE, this short per-call timeout would fire.
+                    self.connection.recv(timeout=MS)
+        finally:
+            thread.join(10 * MS)
+            self.assertFalse(thread.is_alive())
+
+    def test_policy_is_scoped_per_connection(self):
+        """A frame pushed for one connection doesn't affect another connection."""
+        with policy_scope(self.remote_connection, send_admit=SendAdmit.DENY_NEW):
+            self.connection.send("unaffected")
+            with self.assertRaises(SendRejected):
+                self.remote_connection.send("blocked")
+        self.assertFrameSent(Frame(TEXT, b"unaffected"))
+
+    def test_policy_thread_scopes_dont_cross(self):
+        """A frame pushed in one thread doesn't affect a send in another thread."""
+
+        def send_from_other_thread():
+            self.connection.send("from another thread")
+
+        with policy_scope(self.connection, send_admit=SendAdmit.DENY_NEW):
+            with self.assertRaises(SendRejected):
+                self.connection.send("from this thread")
+            with self.run_in_thread(send_from_other_thread):
+                pass
+        self.assertFrameSent(Frame(TEXT, b"from another thread"))
 
 
 class ServerConnectionTests(ClientConnectionTests):

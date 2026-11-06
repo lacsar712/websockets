@@ -37,6 +37,8 @@
     * :exc:`TooManyFragments`
     * :exc:`InvalidState` (Sans-I/O)
     * :exc:`ConcurrencyError`
+    * :exc:`SendRejected`
+    * :exc:`CloseRejected`
 
 """
 
@@ -81,6 +83,8 @@ __all__ = [
     "PayloadTooBig",
     "InvalidState",
     "ConcurrencyError",
+    "SendRejected",
+    "CloseRejected",
 ]
 
 
@@ -530,6 +534,36 @@ class ConcurrencyError(WebSocketException, RuntimeError):
     must be writes. However, reading and writing concurrently is possible.
 
     """
+
+
+class SendRejected(WebSocketException, RuntimeError):
+    """
+    Raised when the policy frame in effect rejects a new :meth:`send`.
+
+    See :mod:`websockets.policy` for details on runtime policy frames.
+
+    """
+
+    def __init__(
+        self,
+        message: str = "sending a new message is rejected by the policy in effect",
+    ) -> None:
+        super().__init__(message)
+
+
+class CloseRejected(WebSocketException, RuntimeError):
+    """
+    Raised when the policy frame in effect rejects an active :meth:`close`.
+
+    See :mod:`websockets.policy` for details on runtime policy frames.
+
+    """
+
+    def __init__(
+        self,
+        message: str = "closing the connection is rejected by the policy in effect",
+    ) -> None:
+        super().__init__(message)
 
 
 # At the bottom to break import cycles created by type annotations.

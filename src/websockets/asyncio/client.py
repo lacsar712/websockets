@@ -24,6 +24,7 @@ from ..extensions.base import ClientExtensionFactory
 from ..extensions.permessage_deflate import enable_client_permessage_deflate
 from ..headers import validate_subprotocols
 from ..http11 import USER_AGENT, Response
+from ..policy import effective_wait_timeout
 from ..protocol import CONNECTING, Event
 from ..proxy import Proxy, get_proxy, parse_proxy, prepare_connect_request
 from ..streams import StreamReader
@@ -100,10 +101,14 @@ class ClientConnection(Connection):
         async with self.send_context(expected_state=CONNECTING):
             self.protocol.send_request(self.request)
 
-        await asyncio.wait(
+        timeout, _ = effective_wait_timeout(self, None)
+        done, _pending = await asyncio.wait(
             [self.response_rcvd, self.connection_lost_waiter],
+            timeout=timeout,
             return_when=asyncio.FIRST_COMPLETED,
         )
+        if not done:
+            raise TimeoutError("timed out while waiting for handshake response")
 
         # self.protocol.handshake_exc is set when the connection is lost before
         # receiving a response, when the response cannot be parsed, or when the

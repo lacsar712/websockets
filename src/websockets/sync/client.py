@@ -26,6 +26,7 @@ from ..extensions.base import ClientExtensionFactory
 from ..extensions.permessage_deflate import enable_client_permessage_deflate
 from ..headers import validate_subprotocols
 from ..http11 import USER_AGENT, Response
+from ..policy import effective_wait_timeout
 from ..protocol import CONNECTING, Event
 from ..proxy import Proxy, get_proxy, parse_proxy, prepare_connect_request
 from ..streams import StreamReader
@@ -121,6 +122,7 @@ class ClientConnection(Connection):
         with self.send_context(expected_state=CONNECTING):
             self.protocol.send_request(self.request)
 
+        timeout, _ = effective_wait_timeout(self, timeout)
         if not self.response_rcvd.wait(timeout):
             raise TimeoutError("timed out while waiting for handshake response")
 

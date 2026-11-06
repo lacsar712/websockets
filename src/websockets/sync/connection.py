@@ -17,6 +17,7 @@ from types import TracebackType
 from typing import Any, Literal, Self, overload
 
 from ..exceptions import (
+    CloseRejected,
     ConcurrencyError,
     ConnectionClosed,
     ConnectionClosedOK,
@@ -25,6 +26,13 @@ from ..exceptions import (
 )
 from ..frames import DATA_OPCODES, PONG, CloseCode, Frame
 from ..http11 import Request, Response
+from ..policy import (
+    CloseGate,
+    admit_send,
+    current_close_gate,
+    effective_wait_timeout,
+    send_can_continue,
+)
 from ..protocol import CLOSED, OPEN, Event, Protocol, State
 from ..typing import BytesLike, Data, DataLike, LoggerLike, Subprotocol
 from .messages import Assembler
@@ -324,6 +332,7 @@ class Connection:
 
         """
         self.maybe_raise_legacy_warning()
+        timeout, _ = effective_wait_timeout(self, timeout)
         try:
             return self.recv_messages.get(timeout, decode)
         except EOFError:
@@ -484,6 +493,8 @@ class Connection:
 
         """
         self.maybe_raise_legacy_warning()
+        # Apply the send admission policy pushed in the current scope, if any.
+        admit_send(self)
         # Unfragmented message — this case must be handled first because
         # strings and bytes-like objects are iterable.
 
@@ -525,6 +536,7 @@ class Connection:
 
             try:
                 # First fragment.
+                send_can_continue(self)
                 if isinstance(chunk, str):
                     with self.send_context():
                         if self.send_in_progress:
@@ -556,6 +568,7 @@ class Connection:
 
                 # Other fragments
                 for chunk in chunks:
+                    send_can_continue(self)
                     if isinstance(chunk, str) and encode:
                         with self.send_context():
                             assert self.send_in_progress
@@ -568,6 +581,7 @@ class Connection:
                         raise TypeError("iterable must contain uniform types")
 
                 # Final fragment.
+                send_can_continue(self)
                 with self.send_context():
                     self.protocol.send_continuation(b"", fin=True)
                     self.send_in_progress = False
@@ -608,8 +622,22 @@ class Connection:
             code: WebSocket close code.
             reason: WebSocket close reason.
 
+        Raises:
+            CloseRejected: If the close gate of the policy frame in effect
+                rejects active closes.
+
         """
         self.maybe_raise_legacy_warning()
+        close_gate = current_close_gate(self)
+        if close_gate is CloseGate.DENY_CLOSE:
+            raise CloseRejected(
+                "closing the connection is denied by the policy in effect"
+            )
+
+        if close_gate is CloseGate.FORCE_CLOSE:
+            self.force_close(code, reason)
+            return
+
         try:
             # The context manager takes care of waiting for the TCP connection
             # to terminate after calling a method that sends a close frame.
@@ -625,6 +653,34 @@ class Connection:
             # Ignore ConnectionClosed exceptions raised from send_context().
             # They mean that the connection is closed, which was the goal.
             pass
+
+    def force_close(
+        self,
+        code: CloseCode | int = CloseCode.NORMAL_CLOSURE,
+        reason: str = "",
+    ) -> None:
+        """
+        Fail the connection immediately and close the socket.
+
+        Unlike :meth:`close`, this doesn't wait for the other end to complete
+        the closing handshake. It still sends a close frame when possible; it
+        doesn't drop messages that were sent earlier.
+
+        """
+        with self.protocol_mutex:
+            if self.protocol.state is OPEN:
+                if self.send_in_progress:
+                    self.protocol.fail(
+                        CloseCode.INTERNAL_ERROR,
+                        "close during fragmented message",
+                    )
+                else:
+                    self.protocol.fail(code, reason)
+                # Write the close frame.
+                self.send_data()
+        self.close_socket()
+        # Wait for the protocol state to be CLOSED before returning.
+        self.recv_events_thread.join()
 
     def wait_closed(self, timeout: float | None = None) -> bool:
         """
@@ -1026,12 +1082,14 @@ class Connection:
                     # Check if the connection is expected to close soon.
                     if self.protocol.close_expected():
                         wait_for_close = True
-                        # Set the close deadline based on the close timeout.
+                        # Set the close deadline based on the close timeout as
+                        # adjusted by the wait policy in the current scope.
                         # Since we tested earlier that protocol.state is OPEN
                         # (or CONNECTING) and we didn't release protocol_mutex,
                         # self.close_deadline is still None.
                         assert self.close_deadline is None
-                        self.close_deadline = Deadline(self.close_timeout)
+                        timeout, _ = effective_wait_timeout(self, self.close_timeout)
+                        self.close_deadline = Deadline(timeout)
                     # Write outgoing data to the socket.
                     try:
                         self.send_data()
@@ -1053,7 +1111,8 @@ class Connection:
                 wait_for_close = True
                 # Calculate close_deadline if it wasn't set yet.
                 if self.close_deadline is None:
-                    self.close_deadline = Deadline(self.close_timeout)
+                    timeout, _ = effective_wait_timeout(self, self.close_timeout)
+                    self.close_deadline = Deadline(timeout)
                 raise_close_exc = True
 
         # To avoid a deadlock, release the connection lock by exiting the
@@ -1062,10 +1121,15 @@ class Connection:
         # If the connection is expected to close soon and the close timeout
         # elapses, close the socket to terminate the connection.
         if wait_for_close:
-            # Thread.join() returns immediately if timeout is negative.
-            assert self.close_deadline is not None
-            timeout = self.close_deadline.timeout(raise_if_elapsed=False)
-            self.recv_events_thread.join(timeout)
+            timeout, governed = effective_wait_timeout(self, self.close_timeout)
+            if governed:
+                # FREEZE removes the timeout; SHRINK_NOW bounds the wait.
+                join_timeout = timeout
+            else:
+                # Thread.join() returns immediately if timeout is negative.
+                assert self.close_deadline is not None
+                join_timeout = self.close_deadline.timeout(raise_if_elapsed=False)
+            self.recv_events_thread.join(join_timeout)
             if self.recv_events_thread.is_alive():
                 # Set connection_exc before closing the socket in order to get
                 # proper exception reporting.
